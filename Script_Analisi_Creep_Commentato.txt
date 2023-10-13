@@ -1,0 +1,1027 @@
+#--------------------------------------------------
+#|      Creep analysis software                   |
+#|      Author: Federico Olla                     |
+#|      Script used to analyze fracture samples   |
+#|      Version 1.1                               |
+#|      Date: 10th Oct 2023                       |
+#--------------------------------------------------
+
+#   This is the main folder where the displacement vs time data is stored, using a folder system defined during 
+#   testing that depends on the date of the end of the test.
+Main_folder='C:\\Users\\fede1\\Desktop\\Python'
+
+#   This is the ouput folder where all the data from the sample analyzed will be stored
+Output_folder='C:\\Users\\fede1\\Desktop\\Python\\00_Output_script'
+
+#   This folder will be used to generate the data for the curve Kc vs ti
+Sorted_folder='C:\\Users\\fede1\\Desktop\\Python\\01_Kc_ti'
+
+
+
+# Import necessary libraries and modules
+import matplotlib.pyplot as plt
+import numpy as np
+from IPython.display import display
+from IPython.display import clear_output 
+import sys
+import math
+from scipy.optimize import minimize
+from scipy.optimize import root_scalar
+from scipy.optimize import minimize_scalar
+from ipywidgets import interact, widgets
+from scipy.optimize import curve_fit
+import os
+import re
+
+
+#   Define a function that calculates the shape factor Y(a/W) for the stress intensity factor
+def Y_s(a,W):
+    return 1.12-1.39*(a/W)+7.32*(a/W)**2-13.1*(a/W)**3+14*(a/W)**4
+
+#   Define a function that calculates the stress intensity factor K=Y(a/W)∙√(σ∙a), the stress is calculated from a 4 point bending configuration
+def K(P,L,a,Bstar,W):
+    return Y_s(a,W)*P*9.80665*L*math.sqrt(3.14159*a/1000)/(Bstar*W**2)
+
+#   Define a function that is used to calculate the creep compliance of the blunt sample using a 5 terms prony viscoelastic funtion from known coefficients    
+def D_prony(t, D0, D1, t1, D2, t2, D3, t3, D4, t4, D5, t5):
+    return D0 + D1 * (1 - np.exp(-t / t1)) + D2 * (1 - np.exp(-t / t2)) + D3 * (1 - np.exp(-t / t3)) + D4 * (1 - np.exp(-t / t4)) + D5 * (1 - np.exp(-t / t5))
+
+#   Define a function that is used to calculate the creep compliance of a notched specimen
+def Phi_Creep(L, a, W, nu, B):
+    pi = np.pi
+    numerator = (
+        L * (
+            (
+                (
+                    (
+                        (19.6 * a**10 / W**10) - 
+                        (40.7556 * a**9 / W**9) + 
+                        (47.0713 * a**8 / W**8) - 
+                        (32.9577 * a**7 / W**7) + 
+                        (20.2267 * a**6 / W**6) - 
+                        (9.93872 * a**5 / W**5) + 
+                        (4.58223 * a**4 / W**4) - 
+                        (1.03787 * a**3 / W**3) + 
+                        (0.6272 * a**2 / W**2)
+                    ) * (2 * L * pi) / W
+                ) + 
+                (5 * L**2) / (27 * W**2) + 
+                (3 * (nu + 2)) / 8
+            )
+        )
+    )
+    denominator = B * W
+    result = numerator / denominator
+    return result
+    
+
+#See descriprtion of the function
+def reduce_arrays(x, y, threshold=1E-4):
+    """
+    Reduces the size of two input arrays (x, y) by filtering out y-values that are within a specified threshold of the previous y-value.
+
+    Parameters:
+    - x (list): Input array representing the x-values.
+    - y (list): Input array representing the y-values. The length should match the length of x.
+    - threshold (float, optional): The maximum absolute difference between consecutive y-values for which the y-value is excluded. Defaults to 1E-4.
+
+    Returns:
+    - tuple: A tuple containing two lists:
+      1. The reduced x-values.
+      2. The corresponding reduced y-values.
+
+    Note:
+    - The first values of the input arrays (x[0] and y[0]) are always included in the output.
+    """
+    reduced_x = [x[0]]
+    reduced_y = [y[0]]
+
+    for i in range(1, len(x)):
+        # Check if the current y value is within the threshold of the last y value
+        if abs(y[i] - reduced_y[-1]) > threshold:
+            reduced_x.append(x[i])
+            reduced_y.append(y[i])
+
+    return reduced_x, reduced_y
+
+
+#See descriprtion of the function
+def get_variable_value(sample_name, variable_name):
+    """
+    Retrieves the value of a specified variable for a given sample name from the database 'Database_Creep.txt' located in the 'Main_folder' directory.
+    
+    The function assumes the database file is tab-separated with the first line being a header that includes the variable names. The rest of the lines are data entries with the first column being the sample name.
+
+    Parameters:
+    - sample_name (str): The name of the sample for which the variable value is to be retrieved.
+    - variable_name (str): The name of the variable whose value is to be retrieved.
+
+    Returns:
+    - float or str or None:
+      * The value of the specified variable for the given sample. If the value looks like a date (format: DD/MM/YYYY), it will return it as a string.
+      * If the variable's value is an empty string or if the sample or variable doesn't exist in the file, the function will return None.
+      * In case of a file not being found, it also returns None.
+
+    Note:
+    - The function uses tab ('\t') as the delimiter for splitting the lines of the file into columns.
+    """
+    
+    try:
+        with open(Main_folder + '\\Database_Creep.txt', 'r') as file:
+            lines = file.readlines()
+            
+            # Find the header line and split it into parts
+            for line in lines:
+                if line.startswith("Sample Exp."):
+                    header = line.split('\t')
+                    break
+            
+            # Search for a substring match in the header
+            variable_index = None
+            for idx, header_item in enumerate(header):
+                if variable_name in header_item:
+                    variable_index = idx
+                    break
+
+            if variable_index is not None:
+                for line in lines[1:]:
+                    parts = line.split('\t')
+                    if parts[0] == sample_name:
+                        value = parts[variable_index]
+                        
+                        # Check if the value is a date (assuming it's in the format DD/MM/YYYY)
+                        if '/' in value and len(value.split('/')) == 3:
+                            # Handle date value (you can customize this part)
+                            return f"{value}"
+                        
+                        # Check if the value is not an empty string
+                        if value.strip() != '':
+                            return float(value)
+    except FileNotFoundError:
+        return None
+    
+    return None
+
+# I define a function to extract the first column of my database file. It will contain the names of the samples.    
+def extract_first_column(database_file):
+    """
+    Extracts the first column (column 0) from a database file.
+
+    Arguments:
+        database_file (str): The path to the database file.
+
+    Returns:
+        list: A list containing the values from the first column.
+    """
+    first_column_values = []
+
+    try:
+        with open(database_file, 'r') as file:
+            lines = file.readlines()
+
+            for line in lines[1:]:
+                parts = line.split('\t')
+                if parts:
+                    first_column_values.append(parts[0])
+    except FileNotFoundError:
+        print(f"File '{database_file}' not found.")
+
+    return first_column_values
+    
+
+# Function to skip the header section if it exists for data extraction from the displacement vs time file
+def skip_header(lines):
+    for i, line in enumerate(lines):
+        if line.strip() == 'X_Value	Untitled	Untitled 1	Comment':
+            return i + 1  # Skip the header and start from the next line
+    return 0  # If the header is not found, start from the beginning
+ 
+
+# Function that defines an hyperbola used for data fitting a(t) --> (a(t)-mb∙t+qb)(a(t)-mg∙t+qg)=k
+def Hyperbola_CG(t, mb, mg, qb, qg, k):
+    """
+    Hyperbolic function used to describe the relationship between dependent (a_t) and independent (t) variables.
+    
+    This function characterizes the relationship in the form: (a(t)-mb∙t+qb)(a(t)-mg∙t+qg)=k
+    
+    Parameters:
+    - t (float or array-like): Independent variable(s).
+    - mb, mg, qb, qg, k (float): Parameters of the hyperbolic function.
+
+    Returns:
+    - float or array-like: Evaluated value(s) of the hyperbolic function for the provided t and parameters.
+    """
+    return 0.5 * (t * mb + t * mg + qb + qg + np.sqrt((-t * mb - t * mg - qb - qg)**2 - 4 * (-k + t**2 * mb * mg + t * mg * qb + t * mb * qg + qb * qg)))
+
+# Derivative od the fitting hyperbole, it is used to calculate da/dt
+def a_dot(t, mb, mg, qb, qg, k):
+    numerator = 2 * (-mb - mg) * (-mb * t - mg * t - qb - qg) - 4 * (2 * mb * mg * t + mb * qg + mg * qb)
+    denominator = 2 * math.sqrt((-mb * t - mg * t - qb - qg)**2 - 4 * (-k + mb * mg * t**2 + mb * qg * t + mg * qb * t + qb * qg))
+    
+    result = 0.5 * (numerator / denominator + mb + mg)
+    return result
+
+def fit_parameters(t, a_t):
+    """
+    Fits data points to the Hyperbola_CG function to determine optimal parameters.
+    
+    This function utilizes the curve fitting methodology to optimize the hyperbolic function's parameters to best fit the provided data. 
+    It estimates initial parameters based on the first and last 50 points of the provided data and then performs curve fitting to refine these parameters.
+    
+    Parameters:
+    - t (array-like): An array of independent variable data (time).
+    - a_t (array-like): An array of dependent variable data, corresponding to each value in t (Crack length).
+
+    Returns:
+    - tuple:
+      1. Array of optimized parameters for the Hyperbola_CG function in the order: mb, mg, qb, qg, k.
+      2. R-squared value indicating the goodness of fit.
+    """
+    
+    # Define the number of points to use for initial guesses
+    num_points_for_guess = 50
+    
+    # Initial guess for mb and qb based on the first 50 points (y=m*x+q)
+    mb_initial_guess = np.polyfit(t[:num_points_for_guess], a_t[:num_points_for_guess], 1)[0]
+    qb_initial_guess = np.polyfit(t[:num_points_for_guess], a_t[:num_points_for_guess], 1)[1]
+    
+    # Initial guess for mg and qg based on the last 50 points (y=m*x+q)
+    mg_initial_guess = np.polyfit(t[-num_points_for_guess:], a_t[-num_points_for_guess:], 1)[0]
+    qg_initial_guess = np.polyfit(t[-num_points_for_guess:], a_t[-num_points_for_guess:], 1)[1]
+    
+    # Initial guess for k based on experience from previous fitting performed
+    k_initial_guess = 500
+    
+    # Combine initial guesses into a tuple
+    initial_guess = (mb_initial_guess, mg_initial_guess, qb_initial_guess, qg_initial_guess, k_initial_guess)
+    
+    # Fit the data to the Hyperbola_CG function using curve_fit
+    params, covariance = curve_fit(Hyperbola_CG, t, a_t, initial_guess, maxfev=100000)
+    
+    # Calculate the fitted curve
+    fitted_curve = Hyperbola_CG(t, *params)
+    
+    # Calculate R-squared value
+    residuals = a_t - fitted_curve
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((a_t - np.mean(a_t))**2)
+    r_squared = 1 - (ss_res / ss_tot)
+    
+    return params, r_squared
+
+
+#|------------------------------------------------------------------------------------|
+#|                                                                                    |
+#|                               Actual code execution                                |
+#|                                                                                    |  
+#|------------------------------------------------------------------------------------|
+
+
+# Get user input for sample to analyze
+Sample=input("Insert the sample you want to analyze. (i.e.:A04alfa1)    ")
+
+# Extract date of testing for the sample from the database, it will be used to find the file path
+DOT=get_variable_value(Sample,"DOT")
+day=DOT[0:2]
+month=DOT[3:5]
+year=DOT[6:10]
+txt_file=Main_folder+"\\"+year+"_"+month+"_"+day+"\\"+Sample+".txt"
+
+# Read displacement vs time data from the text file and skip the header if it exists
+try:
+    with open(txt_file, 'r') as file:
+        lines = file.readlines()
+        start_line = skip_header(lines)
+        x = []
+        y = []
+        for line in lines[start_line:]:
+            parts = line.split()
+            if len(parts) >= 2:  # Ensure at least two columns are present
+                x.append(float(parts[0]))
+                y.append(float(parts[1]))
+except FileNotFoundError:
+    print(f"File '{txt_file}' not found.")
+    sys.exit(0)
+
+# Adjust data and prepare for plotting
+x,y=reduce_arrays(x, y, threshold=5E-4)
+t0=x[0]
+#the absolute position of the LVDT is converted into displacement ΔL(t)=L(t)-L0
+#The value of L0 is extracted from the database using the function "get_variable_value()"
+y = [value - get_variable_value(Sample, "L0") for value in y]
+x = [value - t0 for value in x]
+
+# Create a basic line plot
+plt.figure(figsize=(10, 6)) 
+plt.plot(x, y, label=Sample)
+plt.xlabel('time')
+plt.ylabel('deflection')
+plt.title('deflection plot')
+plt.legend()
+plt.grid(True)
+
+# Show the plot 
+plt.show()
+
+
+# Prompt the user to verify the quality of the plot
+choice=""
+
+while not (choice == "Y" or choice == "N"):
+    choice=input("Is the plot reasonable? (Y or N):  ")
+
+# Exit the script if the plot is not deemed reasonable
+if choice=="N":
+    sys.exit(0)
+
+
+
+clear_output(wait=False)
+
+
+
+# Display an initial scatter plot to verify the beginning of the test
+plt.figure(figsize=(10, 6))  
+plt.scatter(x, y, label=Sample)
+plt.xlabel('time')
+plt.ylabel('deflection')
+plt.title('Test start')
+plt.xlim(-0.5, 2000)  
+plt.ylim(-0.1, 0.1) 
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Allow the user to take actions on the plot. A while cycle is needed: the final answer of the use has to be either 1 (continue analysis) or 3 (quit script). 
+while not (choice == "1" or choice == "2" or choice == "3"):
+    choice = input("Select one of the following:\n"
+               "1: Remove the points before a certain time t and start data elaboration\n"
+               "2: Change plot 'test start' axis coordinates\n"
+               "3: Quit the script\n")   
+    if choice == "1":
+        # Option to remove data points before a specific time and proceed with data processing
+        pass
+    elif choice == "2":
+        # Allow user to redefine plot axis limits for better visualization
+        print("You chose 2.")
+        xmin = float(input("Select x min: "))
+        xmax = float(input("Select x max: "))
+        
+        choice=0
+        clear_output(wait=False)
+        
+        plt.figure(figsize=(10, 6))
+        plt.scatter(x, y, label=Sample)
+        plt.xlabel('time (s)')
+        plt.ylabel('deflection (mm)')
+        plt.title('Test start')
+        plt.xlim(xmin, xmax)  
+        plt.ylim(-0.1, 0.1)  
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    elif choice == "3":
+        print("You chose 3. Exiting the script.")
+        sys.exit(0)
+        break  # Exit the loop to end the script
+    else:
+        # Inform the user about invalid input
+        print("Invalid choice. Please select 1, 2, or 3.")
+
+
+print("\n")
+# Prompt user for threshold value to select the actual start time of the test
+n = int(input("Select threshold: "))
+
+# Convert x and y to NumPy arrays
+x = np.array(x)
+y = np.array(y)
+
+# Filter x and y removing the data before the start of the test
+original_length = len(x)
+x = x[x > n]
+filtered_length = len(x)
+y = y[(original_length - filtered_length):]
+
+# Filter y to remove values less than or equal to 0, This is just a redundant check, should not be required
+original_length = len(y)
+y = y[y > 0]
+filtered_length = len(y)
+x = x[(original_length - filtered_length):]
+
+# Shift the time values in order to start from 0
+t0 = x[0]
+y[0] = 0
+x = [value - t0 for value in x]
+
+# Apply a threshold to the displacement values, in the tests on PE samples any data of deflecion above 4 mm is no longer useful for data analysis
+threshold = 4
+y = [value for value in y if value <= threshold]
+filtered_length = len(y)
+x = x[:filtered_length]
+
+# Calculate Sample compliance C and the fictitious creep compliance D for the sharp sample as arrays
+C = [value / (get_variable_value(Sample, "P") * 9.80665) for value in y]
+D = [value / get_variable_value(Sample, "Phi") for value in C]
+
+# Convert D to a NumPy array
+x = np.array(x)
+D = np.array(D)
+
+x_full=x
+y_full=y
+D_full=D
+C_full=C
+
+# Filter x (time) and D based on the condition (t > 200 sec) values before 200s are considered still in a transient regime and therefore are discarded
+original_length = len(x)
+x = x[x > 200]
+filtered_length = len(x)
+D = D[(original_length - filtered_length):]
+
+# Calculate logarithms with base 10 of the data
+logt = np.log10(x)
+logD = np.log10(D)
+
+clear_output(wait=False)
+
+
+
+#   Extract the list of all the samples in the database. This is done in order to find at least a reference blunt sample
+#   The blunt samples have the notation delta in their name
+database_file = Main_folder + '\\Database_Creep.txt'
+
+List = extract_first_column(database_file)
+
+test_type = "delta"
+
+#   The blunt sample are defined with the following code: XNNdeltaMM
+#   X is the letter that stands for the material 
+#   NN is the number of the plate from which the sample was obtained
+#   delta is the code given to blunt samples
+#   MM is a number from 1 to 12 that identifies the sample.
+
+#   First, filter the results to get only those samples which are blunt (i.e., have "delta" in their name)
+filtered_results = list(filter(lambda s: test_type in s, List))
+#   Further filter the results to get only those blunt samples that refer to the same material as the sharp sample
+filtered_results = list(filter(lambda s: Sample[0] in s, filtered_results)) 
+
+# Create a new list to store all the blunt samples
+valid_results = []
+
+
+#Check if every blunt sample has the parameters required for the Viscoelastic function. If for whatever reason they don't they are discarded.
+for element in filtered_results:
+    # Attempt to get the value of "D0" for the element
+    d0_value = get_variable_value(element, "D0")
+    
+    # Check if the value is not None (indicating success)
+    if d0_value is not None:
+        valid_results.append(element)
+
+if valid_results:
+    for result in valid_results:
+        print(result)
+else:
+    print(f"No valid elements containing '{test_type}' found.")
+    sys.exit(0)
+
+#   The value of the critical stress intensification factor for the sample is extracted from the database, it will be used later.
+kc_s=get_variable_value(Sample, "Kc")
+
+
+#   If there are multiple blunt samples this section of the code plots them all on separate plots comparing their
+#   creep compliance with the fictitious one of the sharp sample.
+#   The user will then select with his expertise what blunt sample he will use for the analysis.
+
+i=1
+if len(valid_results)>1:
+    for blunt in valid_results:
+        #   The necessary values to calculate creep compliance are extracted from the database
+        D0 = get_variable_value(blunt, "D0")
+        D1 = get_variable_value(blunt, "D1")
+        t1 = get_variable_value(blunt, "t1")
+        D2 = get_variable_value(blunt, "D2")
+        t2 = get_variable_value(blunt, "t2")
+        t3 = get_variable_value(blunt, "t3")
+        D4 = get_variable_value(blunt, "D4")
+        D3 = get_variable_value(blunt, "D3")
+        t4 = get_variable_value(blunt, "t4")
+        D5 = get_variable_value(blunt, "D5")
+        t5 = get_variable_value(blunt, "t5")
+        kc_b=get_variable_value(blunt, "Kc")
+        tm=get_variable_value(blunt, "Log(tmax[s])") 
+        
+        #   A set of D values is generated based on the time values of the sharp sample
+        D_blunt = [D_prony(x_value, D0, D1, t1, D2, t2, D3, t3, D4, t4, D5, t5) for x_value in x]
+        logD_blunt = np.log10(D_blunt)
+        
+        
+        #   In order to estimate the vertical translation that is needed only the first half of the test is considered
+        #   The script calculates the average difference in compliance between the sharp sample and the blunt sample
+        #   It also calculates the standard deviation, In this section is not really needed, it is useful later on. 
+        #   This is done in order to plot them already coherently, the correct shift will be defined later by the user 
+        
+        
+        #   Calculate the length of the array
+        array_length = len(logD)
+
+        #   Calculate the first half length
+        first_half_length = array_length // 2
+
+        # Slice both arrays to select the first half
+        first_half_logD = logD[:first_half_length]
+        first_half_logD_blunt = logD_blunt[:first_half_length]
+
+        # Calculate the element-wise difference
+        dif = first_half_logD - first_half_logD_blunt
+
+
+        # Calculate the standard deviation of the differences
+        std_d = np.std(dif)
+
+        avg_dif = np.mean(dif)
+        
+        # Add a constant value to plot them coherently
+        logD_Bmod = logD_blunt + avg_dif
+        
+        
+        
+        plt.figure(figsize=(10, 6))
+        plt.title(f'Blunt n° {i}')
+        plt.plot(logt, logD, label=Sample+ " - K = "+str(kc_s)+" MPa.m^0.5")
+        plt.plot(logt, logD_Bmod, label=blunt + " - K = "+str(kc_b)+" MPa.m^0.5")
+        #   If the timeframe considered exceeds the experimental window of the blunt sample the script notifies with a red
+        #   dashed line the user where the extrapolation of data starts and therefore if the analysis might not be reliable.
+        if(np.max(logt)>tm):
+            plt.axvline(x=tm, color='red', linestyle='--', label='Experimental window blunt sample')
+        
+        plt.xlabel('logt')
+        plt.ylabel('logD')
+        plt.ylim(-3, -1)
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        i=i+1
+    Num_Blunt=input("Insert the blunt of choice: ")
+    clear_output(wait=False)
+else:  
+    Num_Blunt=1
+
+#   The preferable blunt sample is defined
+blunt=valid_results[int(Num_Blunt)-1]
+
+
+#   The necessary values to calculate creep compliance are extracted for the correct blunt sample
+D0 = get_variable_value(blunt, "D0")
+D1 = get_variable_value(blunt, "D1")
+t1 = get_variable_value(blunt, "t1")
+D2 = get_variable_value(blunt, "D2")
+t2 = get_variable_value(blunt, "t2")
+t3 = get_variable_value(blunt, "t3")
+D4 = get_variable_value(blunt, "D4")
+D3 = get_variable_value(blunt, "D3")
+t4 = get_variable_value(blunt, "t4")
+D5 = get_variable_value(blunt, "D5")
+t5 = get_variable_value(blunt, "t5")
+kc_b=get_variable_value(blunt, "Kc")
+tm=get_variable_value(blunt, "Log(tmax[s])")
+
+#   A set of D(t) values is generated based on the time values of the sharp sample
+D_blunt = [D_prony(x_value, D0, D1, t1, D2, t2, D3, t3, D4, t4, D5, t5) for x_value in x]
+logD_blunt = np.log10(D_blunt)
+
+
+#   Same as in the previous cycle
+
+#   In order to estimate the vertical translation that is needed only the first half of the test is considered
+#   The script calculates the average difference in compliance between the sharp sample and the blunt sample
+#   It also calculates the standard deviation, it will be used later define the upper and lower limits of the vertical translation
+#   This is done in order to plot them already coherently, the correct shift will be defined later by the user 
+
+
+# Calculate the length of the arrays
+array_length = len(logD)
+
+# Calculate the first half length
+first_half_length = array_length // 2
+
+# Slice both arrays to select the first half
+first_half_logD = logD[:first_half_length]
+first_half_logD_blunt = logD_blunt[:first_half_length]
+
+# Calculate the element-wise difference
+dif = first_half_logD - first_half_logD_blunt
+
+
+# Calculate the standard deviation of the differences
+std_d = np.std(dif)
+
+
+avg_dif = np.mean(dif)
+
+#   These two limits are the limits of the slider of the interactive plot
+Lmin=-avg_dif-4*std_d
+Lmax=-avg_dif+4*std_d
+
+
+# Define a variable to store the chosen value of w, w is the vertical translation factor 
+chosen_w = None
+
+
+#   I define a function that will be used as an argument of the function interact
+def plot_arrays(w):
+    """
+    Plots two arrays, x and y, and adds a constant value w to y.
+    
+    Args:
+    w (float): Constant value to add to logD.
+    """
+    global chosen_w  # Declare chosen_w as a global variable
+    chosen_w = w  # Save the chosen value of w
+    
+    plt.figure(figsize=(10, 6))  
+
+    #   Add a constant value w to logD
+    logD_with_w = logD + w
+
+    #   Create the plot
+    
+    plt.plot(logt, logD_blunt, label='Blunt sample')  
+    
+    #   Add a check to see if the experimental window of the blunt sample is exceeded
+    if(np.max(logt)>tm):
+            plt.axvline(x=tm, color='red', linestyle='--', label='Experimental window blunt sample')
+    #   Plot logD + w
+    plt.plot(logt, logD_with_w, label='Sharp sample', linestyle='dashed')  
+
+    #   Add labels and a title
+    plt.xlabel('log(t) [s]')
+    plt.ylabel('logD [MPa-1]')
+    plt.title(f'Plot of Blunt vs sharp sample with vertical translation {w}')
+    
+    #   Those limits are defined because of how I am used to visually see the plots.
+    #   I might change them in the future, expecially when I'll analyse new materials
+    plt.ylim(-3, -1)
+
+    # Add a legend and show the plot
+    plt.legend()
+    plt.show()
+
+#   |-----------------------------------------------------------------------------------------------------------------------------------|   
+#   |   Now this is where the code becomes a little tricky. Beacuse of the way Jupyter notebooks handle the interaction with the user   |
+#   |   I struggled to find a way to create an interactive plot, make the user select a value of vertical translation and then continue |
+#   |   with the rest of the code using the value of vertical translation provided by the user.                                         |
+#   |   The issue I kept encountering was the fact that while executing the interaction the code did not wait for the user input and    |
+#   |   it would immediatly execute the following lines of code.                                                                        |
+#   |   In order to get around this issue i defined two functions, the first one "save_and_print_w" is used like this:                  |
+#   |   1. I create an interactive plot                                                                                                 |
+#   |   2. After the active plot I put these lines of code:                                                                             |
+#   |   "   save_button = widgets.Button(description="Next")                                                                            |
+#   |   "   save_button.on_click(save_and_print_w)                                                                                      |
+#   |   So basically I create a button that if pressed saves and stores the value of the vertical translation factor.                   |
+#   |   After being pressed the function "save_and_print_w" has the instruction to call another function called "additional_code(w)"    |
+#   |   In this functions are stored the required instructions of how to analyse the data with the value of w chosen by the user.       |
+#   |-----------------------------------------------------------------------------------------------------------------------------------|
+
+def save_and_print_w(button):
+    global chosen_w
+    if chosen_w is not None:
+        clear_output(wait=False)  # Clear the output screen
+        print(f"Traslation factor: {chosen_w}")
+        additional_code(chosen_w)  # Call the additional_code function with chosen_w
+
+        
+def additional_code(w):
+    # Additional code here based on the chosen value of w
+    
+    logD_w = logD + w
+    #   Define the quantity Rap which is the array containing the values of the sharp fictitious compliance divided
+    #   by the compliance of the blunt speciment. This in a log scale is a difference of course
+    Rap = np.power(10, logD_w - logD_blunt)
+    Limit = np.full(len(logD_w), 1.01)
+    xi = None  # Initialize xi as None
+
+    #   To find the crack onset we check when is the last occurring value of D*(t)/D(t)>1.01 
+    for i in range(len(Rap)):
+        if Rap[i] >= 1.01:
+            if all(value >= 1.01 for value in Rap[i+1:]):
+                xi = x[i]
+                break
+
+    if xi is not None:
+        print(f"The crack onset is at {int(xi)} seconds")
+    else:
+        print("No crack onset was found.")
+
+    #   Plot Ds/Db for reference
+    plt.figure(figsize=(10, 6))
+    plt.scatter(x, Rap, label=Sample, color='orange', s=1)
+    plt.plot(x, Limit, label='1% Threshold', color='red', linestyle='dashed')
+    plt.xlabel('t')
+    plt.ylabel('Ds/Db')
+    plt.title('Crack onset threshold of '+Sample+' based on compliance from '+blunt)
+    
+    # Check if xi is not None before setting the xlim
+    if xi is not None:
+        plt.xlim(200, xi * 1.1)  
+        plt.ylim(0.98, 1.05)
+    
+        # Add legend and grid
+        plt.legend()
+        plt.grid(True)
+    
+        # Show the plot
+        plt.show()
+
+    #   Now that the crack onset is found we have to calculate the propagation of the sample
+    #   Filter x and D based on a condition (t > ti). Consider data only after the crack onset.
+    if xi is not None:
+        original_length = len(x)
+        t_ti = x[x >= xi]
+        t_ti = [value - xi for value in t_ti]
+        filtered_length = len(t_ti)
+        
+        D_prop=D[original_length - filtered_length:]
+        
+        D_prop_w = [value*10**w for value in D_prop]
+        
+        Db_prop = D_blunt[original_length - filtered_length:]
+        
+        #   Extract the values required for the calibration method
+        
+        
+        C_prop = [value*get_variable_value(Sample, "Phi") for value in D_prop_w]    # Array with sharp compliance for t>ti [mm/N]
+        
+        L = 55                                          # Span of 4 point bending [mm]
+        nu = 0.4                                        # Poisson coefficient: approx 0.4
+        W = get_variable_value(Sample, "W")             # Width of sharp sample [mm]
+        B = get_variable_value(Sample, "B")             # Thickness of sharp sample [mm]
+        P = get_variable_value(Sample, "P")             # Dead load of creep test [Kg]
+        Bstar = get_variable_value(Sample, "Bstar")     # Value of B* coefficient for groove corection [mm]
+        
+        
+        #   In order to find propagation data a(t) we have to solve the eq. C/Φ[a(t)]-D[t]=0 this is our objective function
+        
+        
+        # Create lists to store the optimal 'a' values
+        optimal_a_values = []
+        
+        # Define the objective function
+        def objective_function(a, C_prop, Db_prop, L, W, nu, B):
+            # Calculate the difference between the left and right sides of the equation
+            diff = C_prop / Phi_Creep(L, a, W, nu, B) - Db_prop
+            # Return the sum of squared differences
+            return np.sum(diff**2)
+        
+        # Iterate through the sets of points in C_prop and Db_prop
+        for i in range(len(C_prop)):
+            # Initial guess for the parameter 'a' based on 'a0' 
+            a_initial_guess = get_variable_value(Sample, "a0")  
+            bounds = (0, 30)  # Adjust the bounds as needed
+            
+            # Optimize for the current set of points
+            result = minimize_scalar(objective_function, args=(C_prop[i], Db_prop[i], L, W, nu, B), bounds=bounds)
+            
+            # Check if the optimization was successful
+            if result.success:
+                optimal_a = result.x
+                optimal_a_values.append(optimal_a)
+            else:
+                print(f"Optimization failed for set {i+1}.")
+        
+        #   The value of the crack has to start exactly from a0
+        at = [value-optimal_a_values[0] for value in optimal_a_values]    
+        
+        at = [value + get_variable_value(Sample, "a0") for value in at]
+        
+        #   Set the 0.6 threshold. Any values of a(t) above W*0.6 are deemed unreliable due to the accuracy of Y(a/W) being lower than 99%
+        Thvalue = 0.6*W
+        
+        #   Find the index after which all values in 'at' are above the threshold
+        index_above_threshold = None
+        for i, value in enumerate(at):
+            if value <= Thvalue:
+                index_above_threshold = i + 1
+            else:
+                break
+        
+        #   If all values in 'at' are already above the threshold, set index to the length of 'at'
+        if index_above_threshold is None:
+            index_above_threshold = len(at)
+        
+        
+        t_ti_f = t_ti[:index_above_threshold]
+        at_06 = at[:index_above_threshold]
+        
+        t_ti_f, at_06 =reduce_arrays(t_ti_f, at_06, threshold=5E-3)
+        
+        
+        #   Fit the data with the hyperbola and get parameters and R-squared value
+        fit_params, r_squared = fit_parameters(np.array(t_ti_f), np.array(at_06))
+        
+        print("Fitted Parameters:", fit_params)
+        print("R-squared:", r_squared)
+        
+        #   Create an array with the fitted data of a(t)
+        a_fit= [Hyperbola_CG(value, fit_params[0], fit_params[1], fit_params[2], fit_params[3], fit_params[4]) for value in t_ti_f]
+        
+        #   Plot a(t) real vs a(t) fitted for reference
+        plt.figure(figsize=(10, 6))
+        plt.scatter(t_ti_f, at_06, label=Sample, color='orange',s=1)
+        plt.plot(t_ti_f, a_fit, label='Fitted',color='red', linestyle='dashed')
+        plt.xlabel('t-ti (s)')
+        plt.ylabel('a (mm)')
+        plt.legend()
+        plt.grid(True)
+        plt.title('Crack growth of '+ Sample)
+        
+        #   Find the derivative of a(t) from fitted data
+        da_dt= [a_dot(value, fit_params[0], fit_params[1], fit_params[2], fit_params[3], fit_params[4]) for value in t_ti_f]
+        #   Find the value of K(t) after propagation
+        K_t = [K(P, L, a_fit[i], Bstar, W) for i in range(len(a_fit))]
+
+        plt.figure(figsize=(10, 6))
+        plt.scatter(da_dt, K_t, label=Sample, color='orange',s=1)
+        plt.xlabel('da/dt (mm/s)')
+        plt.ylabel('Kc (Mpa*m^0.5)')
+        plt.legend()
+        plt.grid(True)
+        plt.title('K vs crack speed of '+ Sample)
+        
+        
+        #   Now the data anlysis is done, it is just a matter of generating output files
+        
+                # Determine the maximum length among the arrays
+        max_length = max(
+            len(x_full), len(y_full), len(C_full), len(D_full), len(x),
+            len(logt), len(logD), len(logD_w), len(logD_blunt),
+            len(Rap), len(t_ti_f), len(at_06), len(a_fit), len(da_dt), len(K_t)
+        )
+        
+        
+        #   The issue is the fact that I want to Output arrays of different length as columns on a .txt file.
+        #   What I am doing to achieve this is I take the longest array as reference, the sherter ones will have a 
+        #   Blank space where they are empty.
+        
+        # Open the file for writing
+        with open(Output_folder + '\\' + Sample + '.txt', 'w') as file:
+            file.write(
+                #   Header of the output file
+                'Sample name: '+ '\t'+ Sample+ '\n'
+                'Reference blunt: '+ '\t'+ blunt+ '\n'
+                'Vertical shift in log scale (w): '+ '\t'+ str(w)+ '\n'
+                'Crack onset (s): '+ '\t'+ str(xi)+ '\n'
+                'K_critical (MPa*m^0.5): '+ '\t'+ str(kc_s)+ '\n \n'
+                '------------------------------------- \n'
+                'Fitting parameters (a - mb*t - qb)*(a - mg*t - qg) = k \n'
+                'mb:'+ '\t'+ str(fit_params[0]) + '\n'
+                'qb:'+ '\t'+ str(fit_params[2]) + '\n'
+                'mg:'+ '\t'+ str(fit_params[1]) + '\n'
+                'qg:'+ '\t'+ str(fit_params[3]) + '\n'
+                'k:'+ '\t'+ str(fit_params[4]) + '\n\n'
+                'r^2:'+ '\t'+ str(r_squared) + '\n'
+                '------------------------------------- \n'
+            )
+                #   Titles of the columns
+            file.write(
+                'time (s)' + '\t' + 'deflection (mm)' + '\t' + 'Sample Compliance (mm/N)' +
+                '\t' + 'Creep Compliance (MPa-1)' + '\t' + 'logt (s)' +
+                '\t' + 'logD (MPa-1)' + '\t' + 'logD +W (MPa-1)' + '\t' + 'logD_Blunt (MPa-1)' +
+                '\t' + 't<200 (s)' + '\t'+ 'D/Db (-)' + '\t' + 't-ti (s)' + '\t' + 'a (mm)' + '\t' + 'a_fit (mm)' +
+                '\t' + 'da/dt (mm/s)' + '\t' + 'K (Mpa.m^0.5)' + '\n'
+            )
+        
+            # Iterate up to the maximum length
+            for i in range(max_length):
+                row_data = [
+                    x_full[i] if i < len(x_full) else '',
+                    y_full[i] if i < len(y_full) else '',
+                    C_full[i] if i < len(C_full) else '',
+                    D_full[i] if i < len(D_full) else '',
+                    logt[i] if i < len(logt) else '',
+                    logD[i] if i < len(logD) else '',
+                    logD_w[i] if i < len(logD_w) else '',
+                    logD_blunt[i] if i < len(logD_blunt) else '',
+                    x[i] if i < len(x) else '',
+                    Rap[i] if i < len(Rap) else '',
+                    t_ti_f[i] if i < len(t_ti_f) else '',
+                    at_06[i] if i < len(at_06) else '',
+                    a_fit[i] if i < len(a_fit) else '',
+                    da_dt[i] if i < len(da_dt) else '',
+                    K_t[i] if i < len(K_t) else ''
+                ]
+        
+                # Write each element of row_data and add a tab ('\t')
+                for data in row_data:
+                    file.write(str(data) + '\t')
+        
+                file.write('\n')  # Add a newline character at the end of the row
+        
+        
+        
+    #   Now the script generates output files for the Kc vs ti plots by serarching though every data that was generated in
+    #   the folder "Output_folder". It will generate other output files that ill be stored in the folder "Sorted_folder"
+    #   the files will separate between different material and also it will differentiate depending on the the environment, 
+    #   if it is in air (0) or tergitol (1). In total for N materials 2N output files for Kc vs ti data will be generated.
+    
+        # Function to extract data from the output file
+    def extract_data(file_path):
+        data = {}
+        with open(file_path, 'r') as file:
+            content = file.read()
+    
+            # Use regular expressions to find the desired values
+            sample_name = re.search(r'Sample name:\s+(.*?)\n', content)
+            crack_onset = re.search(r'Crack onset \(s\):\s+([\d.]+)', content)
+            k_critical = re.search(r'K_critical \(MPa\*m\^0\.5\):\s+([\d.]+)', content)
+    
+            if sample_name:
+                data['Sample name'] = sample_name.group(1)
+            if crack_onset:
+                data['Crack onset (s)'] = float(crack_onset.group(1))
+            if k_critical:
+                data['K_critical (MPa*m^0.5)'] = float(k_critical.group(1))
+    
+        return data
+
+    # Function to categorize samples into air and tergitol
+    def categorize_sample(sample_name):
+        first_letter = sample_name[0]
+        environment = get_variable_value(sample_name, "Environment") # In the database 0 = air ; 1 = Tergitol
+        if first_letter == 'A':
+            if environment == 0:
+                return 'A_air'
+            elif environment == 1:
+                return 'A_tergitol'
+        elif first_letter == 'B':
+            if environment == 0:
+                return 'B_air'
+            elif environment == 1:
+                return 'B_tergitol'
+        elif first_letter == 'C':
+            if environment == 0:
+                return 'C_air'
+            elif environment == 1:
+                return 'C_tergitol'
+        elif first_letter == 'D':
+            if environment == 0:
+                return 'D_air'
+            elif environment == 1:
+                return 'D_tergitol'
+        return 'Unknown'
+    
+    # List of output files in the folder
+    output_files = [os.path.join(Output_folder, file) for file in os.listdir(Output_folder) if file.endswith('.txt')]
+    
+    # Initialize data categories
+    data_categories = {
+        'A_air': [],
+        'A_tergitol': [],
+        'B_air': [],
+        'B_tergitol': [],
+        'C_air': [],
+        'C_tergitol': [],
+        'D_air': [],
+        'D_tergitol': [],
+    }
+    
+    # Process each output file and extract data
+    for file_path in output_files:
+        data = extract_data(file_path)
+    
+        # Categorize the sample based on sample name and environment
+        category = categorize_sample(data['Sample name'])
+    
+        # Add the data to the appropriate category
+        if category in data_categories:
+            data_categories[category].append(data)
+    
+    # Save data to eight different text files
+    for category, sample_data in data_categories.items():
+        if sample_data:
+            # Define the output file path for the category
+            output_file_path = os.path.join(Sorted_folder, f'{category}.txt')
+            
+            # Write the data to the output file
+            with open(output_file_path, 'w') as output_file:
+                output_file.write("Sample name\tCrack onset (s)\tK_critical (MPa*m^0.5):\n")
+                for data in sample_data:
+                    output_file.write(f"{data['Sample name']}\t{data['Crack onset (s)']:.4f}\t{data['K_critical (MPa*m^0.5)']:.3f}\n")        
+        
+    #------------------------------------------------------------------------------------------------------------------------------------
+    #   Here ends the function additional_code and there are the functions that create an interactive plot and the button "Next"        |
+    #------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+# Create the interactive plot
+interact(plot_arrays, w=widgets.FloatSlider(min=Lmin, max=Lmax, step=0.001, value=-avg_dif, layout={'width': '80%'}))
+
+# Create a button widget
+save_button = widgets.Button(description="Next")
+save_button.on_click(save_and_print_w)  # Attach a function to the button click event
+
+# Display the button
+display(save_button)
